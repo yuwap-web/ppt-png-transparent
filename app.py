@@ -1,296 +1,175 @@
-import os
 import sys
-import traceback
 from pathlib import Path
-
 from PIL import Image
-import tkinter as tk
-from tkinter import ttk, messagebox
 
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    DND_AVAILABLE = True
-except Exception:
-    DND_AVAILABLE = False
-
-
-APP_TITLE = "PPT PNG Transparent Converter"
 OUTPUT_SIZE = (1920, 1080)
+SUPPORTED = [".png"]
 
-# 緑背景の判定設定
-# PowerPoint側は RGB(0,255,0) 推奨
-DEFAULT_G_MIN = 220
-DEFAULT_R_MAX = 80
-DEFAULT_B_MAX = 80
+# PowerPoint向けの緑背景優先判定
+GREEN_G_MIN = 180
+GREEN_DOMINANCE = 50
 
-SUPPORTED_EXTS = {".png"}
-
-
-def is_png_file(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in SUPPORTED_EXTS
+# 自動検出背景色用の許容差
+AUTO_BG_TOLERANCE = 26
 
 
-def collect_pngs(paths):
-    found = []
-    for raw in paths:
-        p = Path(raw).expanduser().resolve()
+def collect_png(paths):
+    files = []
+    for p in paths:
+        p = Path(p)
         if p.is_file():
-            if is_png_file(p):
-                found.append(p)
+            if p.suffix.lower() in SUPPORTED:
+                files.append(p)
         elif p.is_dir():
-            for child in p.rglob("*"):
-                if is_png_file(child):
-                    found.append(child)
+            for f in p.rglob("*.png"):
+                files.append(f)
 
-    unique = []
+    # 重複除去
+    uniq = []
     seen = set()
-    for p in found:
-        s = str(p)
+    for f in files:
+        s = str(f.resolve())
         if s not in seen:
             seen.add(s)
-            unique.append(p)
-    return unique
+            uniq.append(f)
+    return uniq
 
 
-def resize_fullframe_to_1920x1080(img: Image.Image) -> Image.Image:
+def resize_1920(img):
+    img = img.convert("RGBA")
+    if img.size == OUTPUT_SIZE:
+        return img
+    return img.resize(OUTPUT_SIZE, Image.LANCZOS)
+
+
+def is_green_screen_color(r, g, b):
+    return g >= GREEN_G_MIN and (g - max(r, b)) >= GREEN_DOMINANCE
+
+
+def detect_corner_background_color(img):
     """
-    PowerPointで作成したワイド画像全体をそのまま1920x1080へ変換する。
-    トリミングなし、中央再配置なし。
+    四隅の色から背景候補を返す。
+    四隅が完全一致しない場合は最多色を採用。
     """
-    rgba = img.convert("RGBA")
-    if rgba.size == OUTPUT_SIZE:
-        return rgba
-    return rgba.resize(OUTPUT_SIZE, Image.LANCZOS)
+    w, h = img.size
+    points = [
+        (0, 0),
+        (w - 1, 0),
+        (0, h - 1),
+        (w - 1, h - 1),
+    ]
+
+    colors = []
+    for x, y in points:
+        r, g, b, a = img.getpixel((x, y))
+        colors.append((r, g, b))
+
+    counts = {}
+    for c in colors:
+        counts[c] = counts.get(c, 0) + 1
+
+    best = max(counts.items(), key=lambda x: x[1])[0]
+    return best
 
 
-def make_transparent_by_green(img: Image.Image, g_min: int, r_max: int, b_max: int) -> Image.Image:
-    rgba = img.convert("RGBA")
-    pixels = list(rgba.getdata())
-    new_pixels = []
+def is_near_color(rgb, target, tol):
+    return all(abs(rgb[i] - target[i]) <= tol for i in range(3))
 
-    for r, g, b, a in pixels:
-        if g >= g_min and r <= r_max and b <= b_max:
-            new_pixels.append((r, g, b, 0))
+
+def remove_background(img):
+    """
+    1. 緑背景優先
+    2. 緑が少なければ四隅色を背景として自動判定
+    """
+    img = img.convert("RGBA")
+    data = list(img.getdata())
+
+    green_hits = 0
+    sample_step = max(1, len(data) // 50000)  # 大きすぎる画像の負荷軽減
+    for i in range(0, len(data), sample_step):
+        r, g, b, a = data[i]
+        if is_green_screen_color(r, g, b):
+            green_hits += 1
+
+    use_green_mode = green_hits >= 10
+
+    if use_green_mode:
+        new_data = []
+        for r, g, b, a in data:
+            if is_green_screen_color(r, g, b):
+                new_data.append((r, g, b, 0))
+            else:
+                new_data.append((r, g, b, a))
+        img.putdata(new_data)
+        return img, "green"
+
+    bg = detect_corner_background_color(img)
+
+    new_data = []
+    for r, g, b, a in data:
+        if is_near_color((r, g, b), bg, AUTO_BG_TOLERANCE):
+            new_data.append((r, g, b, 0))
         else:
-            new_pixels.append((r, g, b, a))
+            new_data.append((r, g, b, a))
 
-    rgba.putdata(new_pixels)
-    return rgba
-
-
-def output_path_for(src: Path) -> Path:
-    return src.with_name(f"{src.stem}_transparent_1920x1080.png")
+    img.putdata(new_data)
+    return img, f"auto:{bg}"
 
 
-def convert_one(src: Path, g_min: int, r_max: int, b_max: int) -> Path:
-    with Image.open(src) as im:
-        resized = resize_fullframe_to_1920x1080(im)
-        transparent = make_transparent_by_green(resized, g_min, r_max, b_max)
-        out = output_path_for(src)
-        transparent.save(out)
-        return out
+def save_outputs(img, src_path):
+    png_out = src_path.with_name(src_path.stem + "_transparent_1920x1080.png")
+    webp_out = src_path.with_name(src_path.stem + "_transparent_1920x1080.webp")
+
+    img.save(png_out)
+
+    # WebP可逆圧縮寄り
+    img.save(webp_out, "WEBP", lossless=True, quality=100)
+
+    return png_out, webp_out
 
 
-class AppBase:
-    def __init__(self):
-        self.root = None
-        self.log_widget = None
-        self.g_min_var = tk.IntVar(value=DEFAULT_G_MIN)
-        self.r_max_var = tk.IntVar(value=DEFAULT_R_MAX)
-        self.b_max_var = tk.IntVar(value=DEFAULT_B_MAX)
-        self.status_var = tk.StringVar(value="待機中")
+def convert(path):
+    im = Image.open(path)
+    im = resize_1920(im)
+    im, mode = remove_background(im)
+    png_out, webp_out = save_outputs(im, path)
 
-    def log(self, text: str):
-        print(text)
-        if self.log_widget is not None:
-            self.log_widget.insert(tk.END, text + "\n")
-            self.log_widget.see(tk.END)
-            self.root.update_idletasks()
-
-    def set_status(self, text: str):
-        self.status_var.set(text)
-        if self.root is not None:
-            self.root.update_idletasks()
-
-    def process_paths(self, raw_paths):
-        try:
-            pngs = collect_pngs(raw_paths)
-            if not pngs:
-                self.log("PNGが見つかりませんでした。")
-                self.set_status("PNGなし")
-                return
-
-            self.set_status(f"処理中: {len(pngs)} 件")
-            self.log(f"処理開始: {len(pngs)} 件")
-
-            success = 0
-            failed = 0
-
-            g_min = int(self.g_min_var.get())
-            r_max = int(self.r_max_var.get())
-            b_max = int(self.b_max_var.get())
-
-            for src in pngs:
-                try:
-                    out = convert_one(src, g_min, r_max, b_max)
-                    self.log(f"OK  : {src}")
-                    self.log(f"OUT : {out}")
-                    success += 1
-                except Exception as e:
-                    self.log(f"NG  : {src}")
-                    self.log(f"ERR : {e}")
-                    failed += 1
-
-            self.set_status(f"完了: 成功 {success} / 失敗 {failed}")
-            self.log(f"完了: 成功 {success} / 失敗 {failed}")
-
-        except Exception as e:
-            self.set_status("エラー")
-            self.log(f"致命的エラー: {e}")
-            self.log(traceback.format_exc())
-            messagebox.showerror(APP_TITLE, str(e))
-
-
-class TkDnDApp(AppBase):
-    def __init__(self):
-        super().__init__()
-        self.root = TkinterDnD.Tk()
-        self.root.title(APP_TITLE)
-        self.root.geometry("760x560")
-        self.root.minsize(680, 480)
-
-        self.build_ui()
-        self.setup_dnd()
-
-        if len(sys.argv) > 1:
-            self.root.after(300, lambda: self.process_paths(sys.argv[1:]))
-
-    def build_ui(self):
-        outer = ttk.Frame(self.root, padding=12)
-        outer.pack(fill="both", expand=True)
-
-        desc = (
-            "PNGまたはフォルダをここへドラッグ＆ドロップ\n"
-            "緑背景 (RGB 0,255,0 推奨) を透明化し、画像全体をそのまま 1920x1080 で保存します\n"
-            "※ トリミングなし / 中央再配置なし / EXE本体に直接ドロップでも動作"
-        )
-        label = ttk.Label(
-            outer,
-            text=desc,
-            anchor="center",
-            justify="center",
-            font=("", 12)
-        )
-        label.pack(fill="x", pady=(0, 12))
-
-        params = ttk.LabelFrame(outer, text="透明化判定")
-        params.pack(fill="x", pady=(0, 12))
-
-        row = ttk.Frame(params)
-        row.pack(fill="x", padx=10, pady=10)
-
-        ttk.Label(row, text="G 最低値").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Spinbox(row, from_=0, to=255, textvariable=self.g_min_var, width=6).grid(row=0, column=1, sticky="w", padx=(0, 16))
-
-        ttk.Label(row, text="R 最高値").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Spinbox(row, from_=0, to=255, textvariable=self.r_max_var, width=6).grid(row=0, column=3, sticky="w", padx=(0, 16))
-
-        ttk.Label(row, text="B 最高値").grid(row=0, column=4, sticky="w", padx=(0, 6))
-        ttk.Spinbox(row, from_=0, to=255, textvariable=self.b_max_var, width=6).grid(row=0, column=5, sticky="w")
-
-        help_text = "推奨初期値: G>=220, R<=80, B<=80"
-        ttk.Label(params, text=help_text).pack(anchor="w", padx=10, pady=(0, 10))
-
-        drop_frame = tk.Frame(outer, relief="groove", bd=2, bg="#f3f3f3", height=150)
-        drop_frame.pack(fill="x", pady=(0, 12))
-        drop_frame.pack_propagate(False)
-
-        drop_label = tk.Label(
-            drop_frame,
-            text="ここにPNGまたはフォルダをドロップ",
-            bg="#f3f3f3",
-            font=("", 16, "bold")
-        )
-        drop_label.pack(expand=True)
-
-        self.drop_frame = drop_frame
-        self.drop_label = drop_label
-
-        status_bar = ttk.Label(outer, textvariable=self.status_var, anchor="w")
-        status_bar.pack(fill="x", pady=(0, 8))
-
-        self.log_widget = tk.Text(outer, height=16, wrap="word")
-        self.log_widget.pack(fill="both", expand=True)
-
-    def setup_dnd(self):
-        def on_drop(event):
-            files = self.root.tk.splitlist(event.data)
-            self.process_paths(files)
-
-        for widget in (self.root, self.drop_frame, self.drop_label):
-            widget.drop_target_register(DND_FILES)
-            widget.dnd_bind("<<Drop>>", on_drop)
-
-    def run(self):
-        self.root.mainloop()
-
-
-class SimpleTkApp(AppBase):
-    def __init__(self):
-        super().__init__()
-        self.root = tk.Tk()
-        self.root.title(APP_TITLE)
-        self.root.geometry("760x520")
-        self.root.minsize(680, 440)
-
-        self.build_ui()
-
-        if len(sys.argv) > 1:
-            self.root.after(300, lambda: self.process_paths(sys.argv[1:]))
-
-    def build_ui(self):
-        outer = ttk.Frame(self.root, padding=12)
-        outer.pack(fill="both", expand=True)
-
-        desc = (
-            "この環境ではウィンドウへのドラッグ＆ドロップ未対応です\n"
-            "EXE本体へPNGやフォルダを直接ドロップしてください\n"
-            "画像全体をそのまま1920x1080へ変換し、緑背景を透明化します"
-        )
-        ttk.Label(outer, text=desc, justify="center", anchor="center", font=("", 12)).pack(fill="x", pady=(0, 12))
-
-        params = ttk.LabelFrame(outer, text="透明化判定")
-        params.pack(fill="x", pady=(0, 12))
-
-        row = ttk.Frame(params)
-        row.pack(fill="x", padx=10, pady=10)
-
-        ttk.Label(row, text="G 最低値").grid(row=0, column=0, sticky="w", padx=(0, 6))
-        ttk.Spinbox(row, from_=0, to=255, textvariable=self.g_min_var, width=6).grid(row=0, column=1, sticky="w", padx=(0, 16))
-
-        ttk.Label(row, text="R 最高値").grid(row=0, column=2, sticky="w", padx=(0, 6))
-        ttk.Spinbox(row, from_=0, to=255, textvariable=self.r_max_var, width=6).grid(row=0, column=3, sticky="w", padx=(0, 16))
-
-        ttk.Label(row, text="B 最高値").grid(row=0, column=4, sticky="w", padx=(0, 6))
-        ttk.Spinbox(row, from_=0, to=255, textvariable=self.b_max_var, width=6).grid(row=0, column=5, sticky="w")
-
-        status_bar = ttk.Label(outer, textvariable=self.status_var, anchor="w")
-        status_bar.pack(fill="x", pady=(0, 8))
-
-        self.log_widget = tk.Text(outer, height=18, wrap="word")
-        self.log_widget.pack(fill="both", expand=True)
-
-    def run(self):
-        self.root.mainloop()
+    print(f"OK   : {path}")
+    print(f"MODE : {mode}")
+    print(f"PNG  : {png_out}")
+    print(f"WEBP : {webp_out}")
 
 
 def main():
-    if DND_AVAILABLE:
-        app = TkDnDApp()
-    else:
-        app = SimpleTkApp()
-    app.run()
+    if len(sys.argv) == 1:
+        print("PNG または フォルダを EXE にドロップしてください")
+        input()
+        return
 
+    targets = collect_png(sys.argv[1:])
+
+    if not targets:
+        print("PNG が見つかりませんでした")
+        input()
+        return
+
+    print(f"対象: {len(targets)} 件")
+
+    ok = 0
+    ng = 0
+
+    for t in targets:
+        try:
+            convert(t)
+            ok += 1
+        except Exception as e:
+            print(f"ERROR: {t} -> {e}")
+            ng += 1
+
+    print("-" * 40)
+    print(f"完了: 成功 {ok} / 失敗 {ng}")
+    input("Enterで終了...")
+    
 
 if __name__ == "__main__":
     main()
